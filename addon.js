@@ -18,6 +18,68 @@ const TRAKT_CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
 const TRAKT_RAW_DATA_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000; // 7 days
 const DEFAULT_TRAKT_CLIENT_ID = process.env.TRAKT_CLIENT_ID;
 const MAX_AI_RECOMMENDATIONS = 30;
+const TRAKT_HIGH_RATING_THRESHOLD = 8;
+const TRAKT_LOW_RATING_THRESHOLD = 4;
+const TRAKT_PAGE_LIMIT = 100;
+const TRAKT_GENRES = [
+  "action",
+  "adventure",
+  "animation",
+  "biography",
+  "children",
+  "comedy",
+  "crime",
+  "documentary",
+  "drama",
+  "family",
+  "fantasy",
+  "game-show",
+  "history",
+  "home-and-garden",
+  "holiday",
+  "horror",
+  "mini-series",
+  "music",
+  "musical",
+  "mystery",
+  "news",
+  "none",
+  "reality",
+  "romance",
+  "science-fiction",
+  "short",
+  "soap",
+  "special-interest",
+  "sporting-event",
+  "suspense",
+  "talk-show",
+  "thriller",
+  "war",
+  "western",
+  "anime",
+  "superhero",
+  "donghua",
+];
+const TRAKT_GENRE_SET = new Set(TRAKT_GENRES);
+const TRAKT_GENRE_ALIASES = {
+  "sci-fi": "science-fiction",
+  scifi: "science-fiction",
+  "science fiction": "science-fiction",
+  "game show": "game-show",
+  gameshow: "game-show",
+  "talk show": "talk-show",
+  "talkshow": "talk-show",
+  "mini series": "mini-series",
+  miniseries: "mini-series",
+  kids: "children",
+  kid: "children",
+  "kid-friendly": "children",
+  sports: "sporting-event",
+  sport: "sporting-event",
+  "sporting event": "sporting-event",
+  "home and garden": "home-and-garden",
+  "special interest": "special-interest",
+};
 
 // Stats counter for tracking total queries
 let queryCounter = 0;
@@ -253,6 +315,16 @@ const traktCache = new SimpleLRUCache({
   ttl: TRAKT_CACHE_DURATION,
 });
 
+const traktPeopleCache = new SimpleLRUCache({
+  max: 500,
+  ttl: TRAKT_RAW_DATA_CACHE_DURATION, // 7 days
+});
+
+const traktWatchedCheckCache = new SimpleLRUCache({
+  max: 5000,
+  ttl: TRAKT_CACHE_DURATION,
+});
+
 // Cache for TMDB discover API results
 const tmdbDiscoverCache = new SimpleLRUCache({
   max: 1000,
@@ -340,6 +412,88 @@ function mergeAndDeduplicate(newItems, existingItems) {
   return Array.from(existingMap.values());
 }
 
+function createTraktHeaders(clientId, accessToken) {
+  return {
+    "Content-Type": "application/json",
+    "trakt-api-version": "2",
+    "trakt-api-key": clientId,
+    Authorization: `Bearer ${accessToken}`,
+  };
+}
+
+async function makeTraktApiCall(url, headers) {
+  return await withRetry(
+    async () => {
+      const response = await fetch(url, { headers });
+
+      if (response.status === 401) {
+        logger.warn(
+          "Trakt access token is expired. Personalized recommendations will be unavailable until the user updates their configuration."
+        );
+      }
+
+      if (!response.ok) {
+        const error = new Error(`Trakt API error: ${response.status}`);
+        error.status = response.status;
+        throw error;
+      }
+
+      return response;
+    },
+    {
+      maxRetries: 3,
+      baseDelay: 1000,
+      shouldRetry: (error) =>
+        !error.status || (error.status !== 401 && error.status !== 403),
+      operationName: "Trakt API call",
+    }
+  );
+}
+
+async function fetchAllTraktPages(baseUrl, headers, limit = TRAKT_PAGE_LIMIT) {
+  const results = [];
+  let page = 1;
+  let pageCount = 1;
+
+  do {
+    const separator = baseUrl.includes("?") ? "&" : "?";
+    const pageUrl = `${baseUrl}${separator}page=${page}&limit=${limit}`;
+    const response = await makeTraktApiCall(pageUrl, headers);
+    const data = await response.json();
+    if (Array.isArray(data)) {
+      results.push(...data);
+    }
+
+    const headerPageCount = parseInt(
+      response.headers.get("x-pagination-page-count") || "1",
+      10
+    );
+    pageCount = Number.isFinite(headerPageCount) ? headerPageCount : 1;
+    page++;
+  } while (page <= pageCount);
+
+  return results;
+}
+
+function canonicalizeTraktGenre(genre) {
+  const key = (genre || "").toLowerCase().trim();
+  if (!key) return null;
+  const slug = key.replace(/_/g, "-");
+  if (TRAKT_GENRE_SET.has(slug)) return slug;
+  return TRAKT_GENRE_ALIASES[key] || TRAKT_GENRE_ALIASES[slug] || null;
+}
+
+function canonicalizeTraktGenres(genres) {
+  const canonicalGenres = new Set();
+  (genres || []).forEach((genre) => {
+    const canonicalGenre = canonicalizeTraktGenre(genre);
+    if (canonicalGenre) {
+      canonicalGenres.add(canonicalGenre);
+    }
+  });
+  return Array.from(canonicalGenres);
+}
+
 // Modular functions for processing different aspects of Trakt data
 function processGenres(watchedItems, ratedItems) {
   const genres = new Map();
@@ -355,7 +509,7 @@ function processGenres(watchedItems, ratedItems) {
   // Process rated items with weights
   ratedItems?.forEach((item) => {
     const media = item.movie || item.show;
-    const weight = item.rating / 5; // normalize rating to 0-1
+    const weight = item.rating / 10; // Trakt user ratings are 1-10
     media.genres?.forEach((genre) => {
       genres.set(genre, (genres.get(genre) || 0) + weight);
     });
@@ -368,58 +522,56 @@ function processGenres(watchedItems, ratedItems) {
     .map(([genre, count]) => ({ genre, count }));
 }
 
-function processActors(watchedItems, ratedItems) {
+function processActors(watchedItems, ratedItems, peopleData) {
   const actors = new Map();
 
-  // Process watched items
   watchedItems?.forEach((item) => {
     const media = item.movie || item.show;
-    media.cast?.forEach((actor) => {
-      actors.set(actor.name, (actors.get(actor.name) || 0) + 1);
+    const traktId = media?.ids?.trakt;
+    const people = peopleData?.get(traktId);
+    people?.cast?.forEach((name) => {
+      actors.set(name, (actors.get(name) || 0) + 1);
     });
   });
 
-  // Process rated items with weights
   ratedItems?.forEach((item) => {
     const media = item.movie || item.show;
-    const weight = item.rating / 5; // normalize rating to 0-1
-    media.cast?.forEach((actor) => {
-      actors.set(actor.name, (actors.get(actor.name) || 0) + weight);
+    const traktId = media?.ids?.trakt;
+    const weight = item.rating / 10;
+    const people = peopleData?.get(traktId);
+    people?.cast?.forEach((name) => {
+      actors.set(name, (actors.get(name) || 0) + weight);
     });
   });
 
-  // Convert to sorted array
   return Array.from(actors.entries())
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5)
     .map(([actor, count]) => ({ actor, count }));
 }
 
-function processDirectors(watchedItems, ratedItems) {
+function processDirectors(watchedItems, ratedItems, peopleData) {
   const directors = new Map();
 
-  // Process watched items
   watchedItems?.forEach((item) => {
     const media = item.movie || item.show;
-    media.crew?.forEach((person) => {
-      if (person.job === "Director") {
-        directors.set(person.name, (directors.get(person.name) || 0) + 1);
-      }
+    const traktId = media?.ids?.trakt;
+    const people = peopleData?.get(traktId);
+    people?.directors?.forEach((name) => {
+      directors.set(name, (directors.get(name) || 0) + 1);
     });
   });
 
-  // Process rated items with weights
   ratedItems?.forEach((item) => {
     const media = item.movie || item.show;
-    const weight = item.rating / 5; // normalize rating to 0-1
-    media.crew?.forEach((person) => {
-      if (person.job === "Director") {
-        directors.set(person.name, (directors.get(person.name) || 0) + weight);
-      }
+    const traktId = media?.ids?.trakt;
+    const weight = item.rating / 10;
+    const people = peopleData?.get(traktId);
+    people?.directors?.forEach((name) => {
+      directors.set(name, (directors.get(name) || 0) + weight);
     });
   });
 
-  // Convert to sorted array
   return Array.from(directors.entries())
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5)
@@ -442,7 +594,7 @@ function processYears(watchedItems, ratedItems) {
   ratedItems?.forEach((item) => {
     const media = item.movie || item.show;
     const year = parseInt(media.year);
-    const weight = item.rating / 5; // normalize rating to 0-1
+    const weight = item.rating / 10; // Trakt user ratings are 1-10
     if (year) {
       years.set(year, (years.get(year) || 0) + weight);
     }
@@ -476,14 +628,13 @@ function processRatings(ratedItems) {
 }
 
 // Process all preferences in parallel
-async function processPreferencesInParallel(watched, rated, history) {
+async function processPreferencesInParallel(watched, rated, history, peopleData) {
   const processingStart = Date.now();
 
-  // Run all processing functions in parallel
   const [genres, actors, directors, yearRange, ratings] = await Promise.all([
     Promise.resolve(processGenres(watched, rated)),
-    Promise.resolve(processActors(watched, rated)),
-    Promise.resolve(processDirectors(watched, rated)),
+    Promise.resolve(processActors(watched, rated, peopleData)),
+    Promise.resolve(processDirectors(watched, rated, peopleData)),
     Promise.resolve(processYears(watched, rated)),
     Promise.resolve(processRatings(rated)),
   ]);
@@ -569,27 +720,17 @@ async function fetchTraktIncrementalData(
   const startDate = new Date(lastUpdate).toISOString().split(".")[0] + "Z";
 
   const endpoints = [
-    `${TRAKT_API_BASE}/users/me/watched/${type}?extended=full&start_at=${startDate}&page=1&limit=100`,
-    `${TRAKT_API_BASE}/users/me/ratings/${type}?extended=full&start_at=${startDate}&page=1&limit=100`,
-    `${TRAKT_API_BASE}/users/me/history/${type}?extended=full&start_at=${startDate}&page=1&limit=100`,
+    `${TRAKT_API_BASE}/users/me/watched/${type}?extended=full&start_at=${startDate}`,
+    `${TRAKT_API_BASE}/users/me/ratings/${type}?extended=full&start_at=${startDate}`,
+    `${TRAKT_API_BASE}/users/me/history/${type}?extended=full&start_at=${startDate}`,
   ];
 
-  const headers = {
-    "Content-Type": "application/json",
-    "trakt-api-version": "2",
-    "trakt-api-key": clientId,
-    Authorization: `Bearer ${accessToken}`,
-  };
+  const headers = createTraktHeaders(clientId, accessToken);
 
   // Fetch all data in parallel
   const responses = await Promise.all(
     endpoints.map((endpoint) =>
-      makeApiCall(endpoint, headers)
-        .then((res) => res.json())
-        .catch((err) => {
-          logger.error("Trakt API Error:", { endpoint, error: err.message });
-          return [];
-        })
+      fetchAllTraktPages(endpoint, headers)
     )
   );
 
@@ -601,6 +742,80 @@ async function fetchTraktIncrementalData(
 }
 
 // Main function to fetch Trakt data with optimizations
+async function fetchTraktPeopleForItems(clientId, accessToken, watched, rated, type) {
+  const headers = createTraktHeaders(clientId, accessToken);
+
+  // Top 10 most-played watched + top 5 highest-rated Trakt items
+  const topWatched = [...(watched || [])]
+    .sort((a, b) => (b.plays || 0) - (a.plays || 0))
+    .slice(0, 10);
+  const topRated = [...(rated || [])]
+    .filter((item) => item.rating >= TRAKT_HIGH_RATING_THRESHOLD)
+    .slice(0, 5);
+
+  const seenIds = new Set();
+  const candidates = [...topWatched, ...topRated].filter((item) => {
+    const media = item.movie || item.show;
+    const id = media?.ids?.trakt;
+    if (!id || seenIds.has(id)) return false;
+    seenIds.add(id);
+    return true;
+  });
+
+  const results = new Map();
+
+  await Promise.all(
+    candidates.map(async (item) => {
+      const media = item.movie || item.show;
+      const traktId = media?.ids?.trakt;
+      if (!traktId) return;
+
+      const cacheKey = `trakt_people_${type}_${traktId}`;
+      if (traktPeopleCache.has(cacheKey)) {
+        results.set(traktId, traktPeopleCache.get(cacheKey));
+        return;
+      }
+
+      const endpoint =
+        type === "movies"
+          ? `${TRAKT_API_BASE}/movies/${traktId}/people`
+          : `${TRAKT_API_BASE}/shows/${traktId}/people`;
+
+      try {
+        const response = await makeTraktApiCall(endpoint, headers);
+        const data = await response.json();
+
+        const people = {
+          cast: (data.cast || [])
+            .slice(0, 5)
+            .map((c) => c.person?.name)
+            .filter(Boolean),
+          directors: (data.crew?.directing || [])
+            .filter((c) => c.job === "Director")
+            .map((c) => c.person?.name)
+            .filter(Boolean),
+        };
+
+        traktPeopleCache.set(cacheKey, people);
+        results.set(traktId, people);
+      } catch (err) {
+        logger.warn("Failed to fetch Trakt people data", {
+          traktId,
+          error: err.message,
+        });
+      }
+    })
+  );
+
+  logger.info("Trakt people data fetched", {
+    candidateCount: candidates.length,
+    fetchedCount: results.size,
+    type,
+  });
+
+  return results;
+}
+
 async function fetchTraktWatchedAndRated(
   clientId,
   accessToken,
@@ -623,33 +838,13 @@ async function fetchTraktWatchedAndRated(
     return null;
   }
 
-  const makeApiCall = async (url, headers) => {
-    return await withRetry(
-      async () => {
-        const response = await fetch(url, { headers });
-        
-        if (response.status === 401) {
-          logger.warn(
-            "Trakt access token is expired. Personalized recommendations will be unavailable until the user updates their configuration."
-          );
-        }
-        
-        return response;
-      },
-      {
-        maxRetries: 3,
-        baseDelay: 1000,
-        shouldRetry: (error) => !error.status || (error.status !== 401 && error.status !== 403),
-        operationName: "Trakt API call"
-      }
-    );
-  };
+  const traktIdentity = config?.traktUsername || `token_${accessToken}`;
+  const rawCacheKey = `trakt_raw_${traktIdentity}_${type}`;
+  const processedCacheKey = `trakt_${traktIdentity}_${type}`;
 
-  const rawCacheKey = `trakt_raw_${accessToken}_${type}`;
-  const processedCacheKey = `trakt_${accessToken}_${type}`;
-
-  // Check if we have processed data in cache
-  if (traktCache.has(processedCacheKey)) {
+  // If raw data exists, prefer incrementally updating it before processing.
+  // Processed cache is only useful as a fallback for legacy cache state.
+  if (traktCache.has(processedCacheKey) && !traktRawDataCache.has(rawCacheKey)) {
     const cached = traktCache.get(processedCacheKey);
     logger.info("Trakt processed cache hit", {
       cacheKey: processedCacheKey,
@@ -726,32 +921,16 @@ async function fetchTraktWatchedAndRated(
 
     try {
       const fetchStart = Date.now();
-      // Use the original fetch logic for a full refresh but without limits
       const endpoints = [
-        `${TRAKT_API_BASE}/users/me/watched/${type}?extended=full&page=1&limit=100`,
-        `${TRAKT_API_BASE}/users/me/ratings/${type}?extended=full&page=1&limit=100`,
-        `${TRAKT_API_BASE}/users/me/history/${type}?extended=full&page=1&limit=100`,
+        `${TRAKT_API_BASE}/users/me/watched/${type}?extended=full`,
+        `${TRAKT_API_BASE}/users/me/ratings/${type}?extended=full`,
+        `${TRAKT_API_BASE}/users/me/history/${type}?extended=full`,
       ];
 
-      const headers = {
-        "Content-Type": "application/json",
-        "trakt-api-version": "2",
-        "trakt-api-key": clientId,
-        Authorization: `Bearer ${accessToken}`,
-      };
+      const headers = createTraktHeaders(clientId, accessToken);
 
       const responses = await Promise.all(
-        endpoints.map((endpoint) =>
-          makeApiCall(endpoint, headers)
-            .then((res) => res.json())
-            .catch((err) => {
-              logger.error("Trakt API Error:", {
-                endpoint,
-                error: err.message,
-              });
-              return [];
-            })
-        )
+        endpoints.map((endpoint) => fetchAllTraktPages(endpoint, headers))
       );
 
       const fetchTime = Date.now() - fetchStart;
@@ -786,12 +965,21 @@ async function fetchTraktWatchedAndRated(
     }
   }
 
-  // Process the data (raw or incrementally updated) in parallel
+  // Fetch people (cast/directors) for top-watched items to populate actor/director prefs
+  const peopleData = await fetchTraktPeopleForItems(
+    clientId,
+    accessToken,
+    rawData.watched,
+    rawData.rated,
+    type
+  );
+
   const processingStart = Date.now();
   const preferences = await processPreferencesInParallel(
     rawData.watched,
     rawData.rated,
-    rawData.history
+    rawData.history,
+    peopleData
   );
   const processingTime = Date.now() - processingStart;
 
@@ -1548,13 +1736,21 @@ function isRecommendationQuery(query) {
  * @param {Array} ratedItems - The user's rated items from Trakt
  * @returns {boolean} - True if the item is in the watch history or rated items
  */
+function normalizeTitle(title) {
+  return (title || "")
+    .toLowerCase()
+    .replace(/^(the|a|an)\s+/, "")
+    .replace(/[:\-'.,!?]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function isItemWatchedOrRated(item, watchHistory, ratedItems) {
   if (!item) {
     return false;
   }
 
-  // Normalize the item name for comparison
-  const normalizedName = item.name.toLowerCase().trim();
+  const normalizedName = normalizeTitle(item.name);
   const itemYear = parseInt(item.year);
 
   // Debug logging for specific items (uncomment for troubleshooting)
@@ -1574,12 +1770,12 @@ function isItemWatchedOrRated(item, watchHistory, ratedItems) {
       const media = historyItem.movie || historyItem.show;
       if (!media) return false;
 
-      const historyName = media.title.toLowerCase().trim();
+      const historyName = normalizeTitle(media.title);
       const historyYear = parseInt(media.year);
 
       const isMatch =
         normalizedName === historyName &&
-        (!itemYear || !historyYear || itemYear === historyYear);
+        (isNaN(itemYear) || isNaN(historyYear) || Math.abs(itemYear - historyYear) <= 1);
 
       // Debug logging for specific items (uncomment for troubleshooting)
       // if (normalizedName.includes("specific movie title") && isMatch) {
@@ -1600,12 +1796,12 @@ function isItemWatchedOrRated(item, watchHistory, ratedItems) {
       const media = ratedItem.movie || ratedItem.show;
       if (!media) return false;
 
-      const ratedName = media.title.toLowerCase().trim();
+      const ratedName = normalizeTitle(media.title);
       const ratedYear = parseInt(media.year);
 
       const isMatch =
         normalizedName === ratedName &&
-        (!itemYear || !ratedYear || itemYear === ratedYear);
+        (isNaN(itemYear) || isNaN(ratedYear) || Math.abs(itemYear - ratedYear) <= 1);
 
       // Debug logging for specific items (uncomment for troubleshooting)
       // if (normalizedName.includes("specific movie title") && isMatch) {
@@ -1619,6 +1815,84 @@ function isItemWatchedOrRated(item, watchHistory, ratedItems) {
     });
 
   return isWatched || isRated;
+}
+
+function getTraktHistoryType(type) {
+  return type === "movie" ? "movies" : "shows";
+}
+
+async function isMetaWatchedOnTrakt(meta, clientId, accessToken, traktIdentity) {
+  if (!meta?.id || !meta?.type || !clientId || !accessToken) {
+    return false;
+  }
+
+  const historyType = getTraktHistoryType(meta.type);
+  const itemId = encodeURIComponent(meta.id);
+  const stableIdentity = traktIdentity || `token_${accessToken}`;
+  const cacheKey = `watched_check_${stableIdentity}_${historyType}_${itemId}`;
+
+  if (traktWatchedCheckCache.has(cacheKey)) {
+    return traktWatchedCheckCache.get(cacheKey).watched;
+  }
+
+  const headers = createTraktHeaders(clientId, accessToken);
+  const endpoint = `${TRAKT_API_BASE}/users/me/history/${historyType}/${itemId}?limit=1`;
+
+  try {
+    const response = await makeTraktApiCall(endpoint, headers);
+    const data = await response.json();
+    const watched = Array.isArray(data) && data.length > 0;
+
+    traktWatchedCheckCache.set(cacheKey, {
+      watched,
+      checkedAt: Date.now(),
+    });
+
+    return watched;
+  } catch (error) {
+    logger.warn("Targeted Trakt watched check failed", {
+      title: meta.name,
+      year: meta.year,
+      type: meta.type,
+      itemId: meta.id,
+      error: error.message,
+      status: error.status,
+    });
+    return false;
+  }
+}
+
+async function filterWatchedMetasWithTrakt(metas, clientId, accessToken, traktIdentity) {
+  if (!metas?.length || !clientId || !accessToken) {
+    return metas || [];
+  }
+
+  const checks = await Promise.all(
+    metas.map(async (meta) => ({
+      meta,
+      watched: await isMetaWatchedOnTrakt(meta, clientId, accessToken, traktIdentity),
+    }))
+  );
+
+  const filteredMetas = checks
+    .filter((result) => !result.watched)
+    .map((result) => result.meta);
+
+  const removed = checks.filter((result) => result.watched);
+  if (removed.length > 0) {
+    logger.info("Targeted Trakt verification filtered watched metas", {
+      checkedCount: checks.length,
+      filteredCount: removed.length,
+      filteredItems: removed.map((result) => ({
+        title: result.meta.name,
+        year: result.meta.year,
+        type: result.meta.type,
+        id: result.meta.id,
+      })),
+    });
+  }
+
+  return filteredMetas;
 }
 
 /**
@@ -2262,16 +2536,34 @@ function clearFanartCache() {
 
 function clearTraktCache() {
   const size = traktCache.size;
+  const watchedCheckSize = traktWatchedCheckCache.size;
   traktCache.clear();
-  logger.info("Trakt cache cleared", { previousSize: size });
-  return { cleared: true, previousSize: size };
+  traktWatchedCheckCache.clear();
+  logger.info("Trakt cache cleared", {
+    previousSize: size,
+    watchedCheckPreviousSize: watchedCheckSize,
+  });
+  return {
+    cleared: true,
+    previousSize: size,
+    watchedCheckPreviousSize: watchedCheckSize,
+  };
 }
 
 function clearTraktRawDataCache() {
   const size = traktRawDataCache.size;
+  const watchedCheckSize = traktWatchedCheckCache.size;
   traktRawDataCache.clear();
-  logger.info("Trakt raw data cache cleared", { previousSize: size });
-  return { cleared: true, previousSize: size };
+  traktWatchedCheckCache.clear();
+  logger.info("Trakt raw data cache cleared", {
+    previousSize: size,
+    watchedCheckPreviousSize: watchedCheckSize,
+  });
+  return {
+    cleared: true,
+    previousSize: size,
+    watchedCheckPreviousSize: watchedCheckSize,
+  };
 }
 
 function clearQueryAnalysisCache() {
@@ -2343,6 +2635,13 @@ function getCacheStats() {
         ((traktRawDataCache.size / traktRawDataCache.max) * 100).toFixed(2) +
         "%",
     },
+    traktWatchedCheckCache: {
+      size: traktWatchedCheckCache.size,
+      maxSize: traktWatchedCheckCache.max,
+      usagePercentage:
+        ((traktWatchedCheckCache.size / traktWatchedCheckCache.max) * 100).toFixed(2) +
+        "%",
+    },
     queryAnalysisCache: {
       size: queryAnalysisCache.size,
       maxSize: queryAnalysisCache.max,
@@ -2370,6 +2669,7 @@ function serializeAllCaches() {
     fanartCache: fanartCache.serialize(),
     traktCache: traktCache.serialize(),
     traktRawDataCache: traktRawDataCache.serialize(),
+    traktWatchedCheckCache: traktWatchedCheckCache.serialize(),
     queryAnalysisCache: queryAnalysisCache.serialize(),
     similarContentCache: similarContentCache.serialize(),
     stats: {
@@ -2426,6 +2726,12 @@ function deserializeAllCaches(data) {
     );
   }
 
+  if (data.traktWatchedCheckCache) {
+    results.traktWatchedCheckCache = traktWatchedCheckCache.deserialize(
+      data.traktWatchedCheckCache
+    );
+  }
+
   if (data.queryAnalysisCache) {
     results.queryAnalysisCache = queryAnalysisCache.deserialize(
       data.queryAnalysisCache
@@ -2458,23 +2764,25 @@ function deserializeAllCaches(data) {
 async function discoverTypeAndGenres(query, geminiKey, geminiModel) {
   const genAI = new GoogleGenerativeAI(geminiKey);
   const model = genAI.getGenerativeModel({ model: geminiModel });
+  const traktGenreList = TRAKT_GENRES.join(", ");
 
   const promptText = `
 Analyze this recommendation query: "${query}"
 
 Determine:
 1. What type of content is being requested (movie, series, or ambiguous)
-2. What genres are relevant to this query (be specific and use standard genre names)
+2. What genres are relevant to this query.
 
 Respond in a single line with pipe-separated format:
 type|genre1,genre2,genre3
 
 Where:
 - type is one of: movie, series, ambiguous
-- genres are comma-separated without spaces or all if no specific genres are discovered in the query
+- genres must be exact Trakt genre slugs from this list only: ${traktGenreList}
+- use all if no specific genres are discovered in the query
 
 Examples:
-movie|action,thriller,sci-fi
+movie|action,thriller,science-fiction
 series|comedy,drama
 ambiguous|romance,comedy
 movie|all
@@ -2551,14 +2859,21 @@ Do not include any explanatory text before or after your response. Just the sing
         type = "ambiguous";
       }
 
-      // Get genres
-      const genres = parts[1]
-        .split(",")
-        .map((g) => g.trim())
-        .filter((g) => g.length > 0 && g.toLowerCase() !== "ambiguous");
+      // Get genres and force them into Trakt's canonical slug format.
+      const genres = canonicalizeTraktGenres(
+        parts[1]
+          .split(",")
+          .map((g) => g.trim())
+          .filter(
+            (g) =>
+              g.length > 0 &&
+              g.toLowerCase() !== "ambiguous" &&
+              g.toLowerCase() !== "all"
+          )
+      );
 
       // If the only genre is "all", clear the genres array to use all genres
-      if (genres.length === 1 && genres[0].toLowerCase() === "all") {
+      if (parts[1].trim().toLowerCase() === "all") {
         logger.info(
           "'All' genres specified, will use all genres for recommendations",
           {
@@ -2615,28 +2930,39 @@ function filterTraktDataByGenres(traktData, genres) {
   }
 
   const { watched, rated } = traktData;
-  const genreSet = new Set(genres.map((g) => g.toLowerCase()));
+  const genreSet = new Set(canonicalizeTraktGenres(genres));
+
+  if (genreSet.size === 0) {
+    return {
+      recentlyWatched: [],
+      highlyRated: [],
+      lowRated: [],
+    };
+  }
 
   // Helper function to check if an item has any of the specified genres
   const hasMatchingGenre = (item) => {
     const media = item.movie || item.show;
     if (!media || !media.genres || media.genres.length === 0) return false;
 
-    return media.genres.some((g) => genreSet.has(g.toLowerCase()));
+    return media.genres.some((g) => {
+      const canonicalGenre = canonicalizeTraktGenre(g);
+      return canonicalGenre && genreSet.has(canonicalGenre);
+    });
   };
 
   // Filter watched items by genre
   const recentlyWatched = (watched || []).filter(hasMatchingGenre).slice(0, 100);
 
-  // Filter highly rated items (4-5 stars)
+  // Filter highly rated items (Trakt ratings are 1-10)
   const highlyRated = (rated || [])
-    .filter((item) => item.rating >= 4)
+    .filter((item) => item.rating >= TRAKT_HIGH_RATING_THRESHOLD)
     .filter(hasMatchingGenre)
     .slice(0, 100); // Top 100 highly rated
 
-  // Filter low rated items (1-2 stars)
+  // Filter low rated items (Trakt ratings are 1-10)
   const lowRated = (rated || [])
-    .filter((item) => item.rating <= 2)
+    .filter((item) => item.rating <= TRAKT_LOW_RATING_THRESHOLD)
     .filter(hasMatchingGenre)
     .slice(0, 100); // Top 100 low rated
 
@@ -3021,17 +3347,35 @@ const catalogHandler = async function (args, req) {
                 totalRated: traktData.rated.length,
               });
             }
+            filteredTraktData = {
+              recentlyWatched: traktData.watched?.slice(0, 100) || [],
+              highlyRated: (traktData.rated || [])
+                .filter((item) => item.rating >= TRAKT_HIGH_RATING_THRESHOLD)
+                .slice(0, 100),
+              lowRated: (traktData.rated || [])
+                .filter((item) => item.rating <= TRAKT_LOW_RATING_THRESHOLD)
+                .slice(0, 100),
+            };
+            logger.info(
+              "Falling back to broad Trakt data after empty genre filter",
+              {
+                discoveredGenres,
+                recentlyWatchedCount: filteredTraktData.recentlyWatched.length,
+                highlyRatedCount: filteredTraktData.highlyRated.length,
+                lowRatedCount: filteredTraktData.lowRated.length,
+              }
+            );
           }
         } else {
           // When no genres are discovered, use all Trakt data
           filteredTraktData = {
             recentlyWatched: traktData.watched?.slice(0, 100) || [],
             highlyRated: (traktData.rated || [])
-              .filter((item) => item.rating >= 4)
-              .slice(0, 25),
+              .filter((item) => item.rating >= TRAKT_HIGH_RATING_THRESHOLD)
+              .slice(0, 100),
             lowRated: (traktData.rated || [])
-              .filter((item) => item.rating <= 2)
-              .slice(0, 25),
+              .filter((item) => item.rating <= TRAKT_LOW_RATING_THRESHOLD)
+              .slice(0, 100),
           };
 
           logger.info(
@@ -3248,10 +3592,10 @@ const catalogHandler = async function (args, req) {
             filteredTraktData || {
               recentlyWatched: traktData.watched?.slice(0, 100) || [],
               highlyRated: (traktData.rated || [])
-                .filter((item) => item.rating >= 4)
+                .filter((item) => item.rating >= TRAKT_HIGH_RATING_THRESHOLD)
                 .slice(0, 25),
               lowRated: (traktData.rated || [])
-                .filter((item) => item.rating <= 2)
+                .filter((item) => item.rating <= TRAKT_LOW_RATING_THRESHOLD)
                 .slice(0, 25),
             };
 
@@ -3259,10 +3603,10 @@ const catalogHandler = async function (args, req) {
           let genreRecommendationStrategy = "";
           if (discoveredGenres.length > 0) {
             const queryGenres = new Set(
-              discoveredGenres.map((g) => g.toLowerCase())
+              canonicalizeTraktGenres(discoveredGenres)
             );
             const userGenres = new Set(
-              preferences.genres.map((g) => g.genre.toLowerCase())
+              canonicalizeTraktGenres(preferences.genres.map((g) => g.genre))
             );
             const overlap = [...queryGenres].filter((g) => userGenres.has(g));
 
@@ -3271,7 +3615,10 @@ const catalogHandler = async function (args, req) {
               const media = item.movie || item.show;
               return (
                 media.genres &&
-                media.genres.some((g) => queryGenres.has(g.toLowerCase()))
+                media.genres.some((g) => {
+                  const canonicalGenre = canonicalizeTraktGenre(g);
+                  return canonicalGenre && queryGenres.has(canonicalGenre);
+                })
               );
             }).length;
 
@@ -3318,12 +3665,12 @@ const catalogHandler = async function (args, req) {
 
           if (highlyRated.length > 0) {
             promptText.push(
-              "Highly rated (4-5 stars) in these genres:",
+              "Highly rated (8-10 on Trakt) in these genres:",
               highlyRated
                 .slice(0, 25)
                 .map((item) => {
                   const media = item.movie || item.show;
-                  return `- ${media.title} (${item.rating}/5) - ${
+                  return `- ${media.title} (${item.rating}/10) - ${
                     media.genres?.join(", ") || "N/A"
                   }`;
                 })
@@ -3334,12 +3681,12 @@ const catalogHandler = async function (args, req) {
 
           if (lowRated.length > 0) {
             promptText.push(
-              "Low rated (1-2 stars) in these genres:",
+              "Low rated (1-4 on Trakt) in these genres:",
               lowRated
                 .slice(0, 15)
                 .map((item) => {
                   const media = item.movie || item.show;
-                  return `- ${media.title} (${item.rating}/5) - ${
+                  return `- ${media.title} (${item.rating}/10) - ${
                     media.genres?.join(", ") || "N/A"
                   }`;
                 })
@@ -3359,17 +3706,25 @@ const catalogHandler = async function (args, req) {
             );
           }
 
+          if (preferences.actors.length > 0) {
+            promptText.push(
+              "Favorite actors:",
+              preferences.actors
+                .map((a) => `- ${a.actor} (Score: ${a.count.toFixed(2)})`)
+                .join("\n"),
+              ""
+            );
+          }
+          if (preferences.directors.length > 0) {
+            promptText.push(
+              "Preferred directors:",
+              preferences.directors
+                .map((d) => `- ${d.director} (Score: ${d.count.toFixed(2)})`)
+                .join("\n"),
+              ""
+            );
+          }
           promptText.push(
-            "Favorite actors:",
-            preferences.actors
-              .map((a) => `- ${a.actor} (Score: ${a.count.toFixed(2)})`)
-              .join("\n"),
-            "",
-            "Preferred directors:",
-            preferences.directors
-              .map((d) => `- ${d.director} (Score: ${d.count.toFixed(2)})`)
-              .join("\n"),
-            "",
             preferences.yearRange
               ? `User tends to watch content from ${preferences.yearRange.start} to ${preferences.yearRange.end}, with a preference for ${preferences.yearRange.preferred}`
               : "",
@@ -3837,7 +4192,16 @@ const catalogHandler = async function (args, req) {
         )
       );
 
-      const metas = (await Promise.all(metaPromises)).filter(Boolean);
+      let metas = (await Promise.all(metaPromises)).filter(Boolean);
+
+      if (traktData && DEFAULT_TRAKT_CLIENT_ID && configData.TraktAccessToken) {
+        metas = await filterWatchedMetasWithTrakt(
+          metas,
+          DEFAULT_TRAKT_CLIENT_ID,
+          configData.TraktAccessToken,
+          configData.traktUsername
+        );
+      }
 
       // Log detailed results
       logger.debug("Meta conversion results", {
