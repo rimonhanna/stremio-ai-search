@@ -653,7 +653,7 @@ async function startServer() {
                 }
                 if (tokenData) {
                   // Check if token is expired (with a 5-minute buffer)
-                  if (tokenData.expires_at < Date.now() - 5 * 60 * 1000) {
+                  if (tokenData.expires_at < Date.now() + 5 * 60 * 1000) {
                     const newTokens = await refreshTraktToken(decryptedConfig.traktUsername, tokenData.refresh_token);
                     if (newTokens) {
                       decryptedConfig.TraktAccessToken = newTokens.access_token;

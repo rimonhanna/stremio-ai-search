@@ -28,7 +28,7 @@ An intelligent search addon for Stremio powered by Google's Gemini AI. Get perso
 4. Install
 5. Buy me a coffee :)
    <br/><br/>
-   <a href="https://buymeacoffee.com/itcon">
+   <a href="https://www.paypal.com/paypalme/payrimon">
    <img src="public/bmc.png" alt="Buy Me A Coffee" height="40" />
    </a>
 
