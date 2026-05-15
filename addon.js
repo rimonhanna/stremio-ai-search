@@ -325,6 +325,11 @@ const traktWatchedCheckCache = new SimpleLRUCache({
   ttl: TRAKT_CACHE_DURATION,
 });
 
+const traktIdLookupCache = new SimpleLRUCache({
+  max: 5000,
+  ttl: TRAKT_RAW_DATA_CACHE_DURATION,
+});
+
 // Cache for TMDB discover API results
 const tmdbDiscoverCache = new SimpleLRUCache({
   max: 1000,
@@ -1745,6 +1750,27 @@ function normalizeTitle(title) {
     .trim();
 }
 
+function getComparableIdsFromItem(item) {
+  const ids = item?.ids || {};
+  const imdbId = item?.imdb_id || item?.imdbId || ids.imdb || (typeof item?.id === "string" && item.id.startsWith("tt") ? item.id : null);
+  return {
+    trakt: item?.trakt_id || item?.traktId || ids.trakt || null,
+    imdb: imdbId || null,
+    tmdb: item?.tmdb_id || item?.tmdbId || ids.tmdb || null,
+  };
+}
+
+function hasMatchingMediaIds(item, media) {
+  const itemIds = getComparableIdsFromItem(item);
+  const mediaIds = media?.ids || {};
+
+  return (
+    (itemIds.trakt && mediaIds.trakt && String(itemIds.trakt) === String(mediaIds.trakt)) ||
+    (itemIds.imdb && mediaIds.imdb && itemIds.imdb === mediaIds.imdb) ||
+    (itemIds.tmdb && mediaIds.tmdb && String(itemIds.tmdb) === String(mediaIds.tmdb))
+  );
+}
+
 function isItemWatchedOrRated(item, watchHistory, ratedItems) {
   if (!item) {
     return false;
@@ -1769,6 +1795,10 @@ function isItemWatchedOrRated(item, watchHistory, ratedItems) {
     watchHistory.some((historyItem) => {
       const media = historyItem.movie || historyItem.show;
       if (!media) return false;
+
+      if (hasMatchingMediaIds(item, media)) {
+        return true;
+      }
 
       const historyName = normalizeTitle(media.title);
       const historyYear = parseInt(media.year);
@@ -1796,6 +1826,10 @@ function isItemWatchedOrRated(item, watchHistory, ratedItems) {
       const media = ratedItem.movie || ratedItem.show;
       if (!media) return false;
 
+      if (hasMatchingMediaIds(item, media)) {
+        return true;
+      }
+
       const ratedName = normalizeTitle(media.title);
       const ratedYear = parseInt(media.year);
 
@@ -1821,13 +1855,75 @@ function getTraktHistoryType(type) {
   return type === "movie" ? "movies" : "shows";
 }
 
+function getTraktSearchType(type) {
+  return type === "movie" ? "movie" : "show";
+}
+
+async function resolveTraktIdsForMeta(meta, clientId, accessToken) {
+  if (!meta?.type || !clientId || !accessToken) {
+    return null;
+  }
+
+  const existingIds = getComparableIdsFromItem(meta);
+  if (existingIds.trakt) {
+    return existingIds;
+  }
+
+  const searchType = getTraktSearchType(meta.type);
+  const headers = createTraktHeaders(clientId, accessToken);
+  const lookupCandidates = [
+    meta.imdb_id ? { source: "imdb", id: meta.imdb_id } : null,
+    meta.id?.startsWith("tt") ? { source: "imdb", id: meta.id } : null,
+    meta.tmdb_id ? { source: "tmdb", id: meta.tmdb_id } : null,
+  ].filter(Boolean);
+
+  for (const candidate of lookupCandidates) {
+    const cacheKey = `trakt_id_lookup_${searchType}_${candidate.source}_${candidate.id}`;
+    if (traktIdLookupCache.has(cacheKey)) {
+      return traktIdLookupCache.get(cacheKey);
+    }
+
+    try {
+      const endpoint = `${TRAKT_API_BASE}/search/${candidate.source}/${encodeURIComponent(candidate.id)}?type=${searchType}`;
+      const response = await makeTraktApiCall(endpoint, headers);
+      const data = await response.json();
+      const match = Array.isArray(data) ? data.find((result) => result.movie || result.show) : null;
+      const media = match?.movie || match?.show;
+
+      if (media?.ids) {
+        const resolvedIds = {
+          trakt: media.ids.trakt || null,
+          imdb: media.ids.imdb || existingIds.imdb || null,
+          tmdb: media.ids.tmdb || existingIds.tmdb || null,
+        };
+        traktIdLookupCache.set(cacheKey, resolvedIds);
+        return resolvedIds;
+      }
+    } catch (error) {
+      logger.warn("Failed to resolve Trakt IDs for meta", {
+        title: meta.name,
+        year: meta.year,
+        type: meta.type,
+        source: candidate.source,
+        id: candidate.id,
+        error: error.message,
+        status: error.status,
+      });
+    }
+  }
+
+  return existingIds;
+}
+
 async function isMetaWatchedOnTrakt(meta, clientId, accessToken, traktIdentity) {
   if (!meta?.id || !meta?.type || !clientId || !accessToken) {
     return false;
   }
 
   const historyType = getTraktHistoryType(meta.type);
-  const itemId = encodeURIComponent(meta.id);
+  const resolvedIds = await resolveTraktIdsForMeta(meta, clientId, accessToken);
+  const lookupId = resolvedIds?.trakt || resolvedIds?.imdb || meta.id;
+  const itemId = encodeURIComponent(lookupId);
   const stableIdentity = traktIdentity || `token_${accessToken}`;
   const cacheKey = `watched_check_${stableIdentity}_${historyType}_${itemId}`;
 
@@ -1855,6 +1951,7 @@ async function isMetaWatchedOnTrakt(meta, clientId, accessToken, traktIdentity) 
       year: meta.year,
       type: meta.type,
       itemId: meta.id,
+      lookupId,
       error: error.message,
       status: error.status,
     });
@@ -1862,7 +1959,7 @@ async function isMetaWatchedOnTrakt(meta, clientId, accessToken, traktIdentity) 
   }
 }
 
-async function filterWatchedMetasWithTrakt(metas, clientId, accessToken, traktIdentity) {
+async function filterWatchedMetasWithTrakt(metas, clientId, accessToken, traktIdentity, watchHistory = [], ratedItems = []) {
   if (!metas?.length || !clientId || !accessToken) {
     return metas || [];
   }
@@ -1870,7 +1967,9 @@ async function filterWatchedMetasWithTrakt(metas, clientId, accessToken, traktId
   const checks = await Promise.all(
     metas.map(async (meta) => ({
       meta,
-      watched: await isMetaWatchedOnTrakt(meta, clientId, accessToken, traktIdentity),
+      watched:
+        isItemWatchedOrRated(meta, watchHistory, ratedItems) ||
+        await isMetaWatchedOnTrakt(meta, clientId, accessToken, traktIdentity),
     }))
   );
 
@@ -2263,6 +2362,12 @@ const tmdbData = await searchTMDB(
     id: tmdbData.imdb_id,
     type: type,
     name: tmdbData.title || tmdbData.name,
+    imdb_id: tmdbData.imdb_id,
+    tmdb_id: tmdbData.tmdb_id,
+    ids: {
+      imdb: tmdbData.imdb_id,
+      tmdb: tmdbData.tmdb_id,
+    },
     description:
       platform === "android-tv"
         ? (tmdbData.overview || "").slice(0, 200)
@@ -2539,6 +2644,7 @@ function clearTraktCache() {
   const watchedCheckSize = traktWatchedCheckCache.size;
   traktCache.clear();
   traktWatchedCheckCache.clear();
+  traktIdLookupCache.clear();
   logger.info("Trakt cache cleared", {
     previousSize: size,
     watchedCheckPreviousSize: watchedCheckSize,
@@ -2555,6 +2661,7 @@ function clearTraktRawDataCache() {
   const watchedCheckSize = traktWatchedCheckCache.size;
   traktRawDataCache.clear();
   traktWatchedCheckCache.clear();
+  traktIdLookupCache.clear();
   logger.info("Trakt raw data cache cleared", {
     previousSize: size,
     watchedCheckPreviousSize: watchedCheckSize,
@@ -2642,6 +2749,13 @@ function getCacheStats() {
         ((traktWatchedCheckCache.size / traktWatchedCheckCache.max) * 100).toFixed(2) +
         "%",
     },
+    traktIdLookupCache: {
+      size: traktIdLookupCache.size,
+      maxSize: traktIdLookupCache.max,
+      usagePercentage:
+        ((traktIdLookupCache.size / traktIdLookupCache.max) * 100).toFixed(2) +
+        "%",
+    },
     queryAnalysisCache: {
       size: queryAnalysisCache.size,
       maxSize: queryAnalysisCache.max,
@@ -2670,6 +2784,7 @@ function serializeAllCaches() {
     traktCache: traktCache.serialize(),
     traktRawDataCache: traktRawDataCache.serialize(),
     traktWatchedCheckCache: traktWatchedCheckCache.serialize(),
+    traktIdLookupCache: traktIdLookupCache.serialize(),
     queryAnalysisCache: queryAnalysisCache.serialize(),
     similarContentCache: similarContentCache.serialize(),
     stats: {
@@ -2729,6 +2844,12 @@ function deserializeAllCaches(data) {
   if (data.traktWatchedCheckCache) {
     results.traktWatchedCheckCache = traktWatchedCheckCache.deserialize(
       data.traktWatchedCheckCache
+    );
+  }
+
+  if (data.traktIdLookupCache) {
+    results.traktIdLookupCache = traktIdLookupCache.deserialize(
+      data.traktIdLookupCache
     );
   }
 
@@ -4199,7 +4320,9 @@ const catalogHandler = async function (args, req) {
           metas,
           DEFAULT_TRAKT_CLIENT_ID,
           configData.TraktAccessToken,
-          configData.traktUsername
+          configData.traktUsername,
+          traktData.watched.concat(traktData.history || []),
+          traktData.rated
         );
       }
 
