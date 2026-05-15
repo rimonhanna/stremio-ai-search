@@ -1424,7 +1424,15 @@
               return response.json();
             })
             .then((config) => {
-              console.log("Loaded configuration:", config);
+              console.log("Loaded configuration:", {
+                ...config,
+                GeminiApiKey: config.GeminiApiKey ? "[redacted]" : undefined,
+                TmdbApiKey: config.TmdbApiKey ? "[redacted]" : undefined,
+                RpdbApiKey: config.RpdbApiKey ? "[redacted]" : undefined,
+                FanartApiKey: config.FanartApiKey ? "[redacted]" : undefined,
+                TraktAccessToken: config.TraktAccessToken ? "[redacted]" : undefined,
+                TraktRefreshToken: config.TraktRefreshToken ? "[redacted]" : undefined,
+              });
 
               // Pre-fill the form with the existing configuration
               if (config.GeminiApiKey)
@@ -1483,6 +1491,19 @@
                 // NEW CONFIG: User is already migrated.
                 console.log("Loading new config with traktUsername:", config.traktUsername);
                 document.getElementById("traktUsername").value = config.traktUsername;
+                if (config.TraktAccessToken) {
+                  document.getElementById("traktAccessToken").value = config.TraktAccessToken;
+                }
+                if (config.TraktRefreshToken) {
+                  document.getElementById("traktRefreshToken").value = config.TraktRefreshToken;
+                }
+                if (config.TraktTokenExpiresAt) {
+                  const secondsRemaining = Math.max(
+                    0,
+                    Math.floor((config.TraktTokenExpiresAt - Date.now()) / 1000)
+                  );
+                  document.getElementById("traktExpiresIn").value = secondsRemaining;
+                }
                 // The validateAndRefreshTraktToken call later will handle the UI update.
 
               } else if (config.TraktAccessToken) {

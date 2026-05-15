@@ -637,13 +637,28 @@ async function startServer() {
 
               // If user is configured with Trakt, get and refresh tokens if needed
               if (decryptedConfig.traktUsername) {
+                const encryptedTokenData =
+                  decryptedConfig.TraktAccessToken && decryptedConfig.TraktRefreshToken
+                    ? {
+                        access_token: decryptedConfig.TraktAccessToken,
+                        refresh_token: decryptedConfig.TraktRefreshToken,
+                        expires_at: decryptedConfig.TraktTokenExpiresAt || 0,
+                        source: "encrypted_config",
+                      }
+                    : null;
                 let tokenData = await getTokens(decryptedConfig.traktUsername);
+                if (!tokenData && encryptedTokenData) {
+                  tokenData = encryptedTokenData;
+                  logger.warn(`Using encrypted config Trakt token fallback for ${decryptedConfig.traktUsername}.`);
+                }
                 if (tokenData) {
                   // Check if token is expired (with a 5-minute buffer)
                   if (tokenData.expires_at < Date.now() - 5 * 60 * 1000) {
                     const newTokens = await refreshTraktToken(decryptedConfig.traktUsername, tokenData.refresh_token);
                     if (newTokens) {
                       decryptedConfig.TraktAccessToken = newTokens.access_token;
+                      decryptedConfig.TraktRefreshToken = newTokens.refresh_token;
+                      decryptedConfig.TraktTokenExpiresAt = Date.now() + newTokens.expires_in * 1000;
                     } else {
                       // Refresh failed, proceed without a token
                       delete decryptedConfig.TraktAccessToken;
@@ -1411,6 +1426,9 @@ async function startServer() {
             traktAuthData.expiresIn
           );
           configData.traktUsername = traktAuthData.username;
+          configData.TraktAccessToken = traktAuthData.accessToken;
+          configData.TraktRefreshToken = traktAuthData.refreshToken;
+          configData.TraktTokenExpiresAt = Date.now() + traktAuthData.expiresIn * 1000;
         }
 
         if (!configData.RpdbApiKey) {
