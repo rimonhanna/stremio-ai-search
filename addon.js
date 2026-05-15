@@ -3313,6 +3313,57 @@ const catalogHandler = async function (args, req) {
       logger.info("Processing search query", { searchQuery, type });
     }
 
+    // Override Omni Hub-style personalized queries with fresh Trakt data.
+    // Omni Hub builds queries like "The user recently watched X, Y. Please suggest similar series."
+    // from its own stale cache. When Trakt is configured we replace it with a fresh query; when
+    // it isn't (or Trakt fails) we at minimum fix the "series"-only wording so both catalogs show.
+    const OMNI_HUB_QUERY_PATTERN = /The user recently watched|recently watched[\s\S]*suggest similar/i;
+    if (OMNI_HUB_QUERY_PATTERN.test(searchQuery)) {
+      if (DEFAULT_TRAKT_CLIENT_ID && configData.TraktAccessToken) {
+        try {
+          const overrideTraktData = await fetchTraktWatchedAndRated(
+            DEFAULT_TRAKT_CLIENT_ID,
+            configData.TraktAccessToken,
+            type === "movie" ? "movies" : "shows",
+            configData
+          );
+          if (overrideTraktData?.history?.length > 0) {
+            const seen = new Set();
+            const titles = [];
+            for (const item of overrideTraktData.history) {
+              const media = item.movie || item.show;
+              if (media?.title && !seen.has(media.title)) {
+                seen.add(media.title);
+                titles.push(media.title);
+              }
+              if (titles.length >= 10) break;
+            }
+            if (titles.length > 0) {
+              searchQuery = `Recommend movies and series similar to these recently watched titles: ${titles.join(", ")}.`;
+              logger.info("Replaced Omni Hub query with fresh Trakt query", {
+                titleCount: titles.length,
+                newQuery: searchQuery,
+              });
+            } else {
+              searchQuery = searchQuery.replace(/suggest similar series\b/gi, "suggest similar movies and series");
+              logger.info("Trakt history empty, auto-fixed Omni Hub query", { searchQuery });
+            }
+          } else {
+            searchQuery = searchQuery.replace(/suggest similar series\b/gi, "suggest similar movies and series");
+            logger.info("Trakt returned no data, auto-fixed Omni Hub query", { searchQuery });
+          }
+        } catch (overrideErr) {
+          logger.warn("Trakt override failed, auto-fixing Omni Hub query as fallback", {
+            error: overrideErr.message,
+          });
+          searchQuery = searchQuery.replace(/suggest similar series\b/gi, "suggest similar movies and series");
+        }
+      } else {
+        searchQuery = searchQuery.replace(/suggest similar series\b/gi, "suggest similar movies and series");
+        logger.info("Trakt not configured, auto-fixed Omni Hub query", { searchQuery });
+      }
+    }
+
     // First, determine the intent for ALL queries
     const intent = determineIntentFromKeywords(searchQuery);
 
