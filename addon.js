@@ -230,6 +230,9 @@ const aiRecommendationsCache = new SimpleLRUCache({
   ttl: AI_CACHE_DURATION,
 });
 
+// Tracks in-flight AI requests to prevent duplicate concurrent Gemini calls
+const aiInFlightRequests = new Map();
+
 const rpdbCache = new SimpleLRUCache({
   max: 25000,
   ttl: RPDB_CACHE_DURATION,
@@ -1731,7 +1734,13 @@ function extractGenreCriteria(query) {
 
 // Add this function to better detect recommendation queries
 function isRecommendationQuery(query) {
-  return query.toLowerCase().trim().startsWith("recommend");
+  const q = query.toLowerCase().trim();
+  return (
+    q.startsWith("recommend") ||
+    q.includes("the user recently watched") ||
+    q.includes("suggest similar") ||
+    q.includes("please suggest")
+  );
 }
 
 /**
@@ -3717,6 +3726,40 @@ const catalogHandler = async function (args, req) {
       });
     }
 
+    // Deduplicate concurrent requests: if an identical query is already in flight,
+    // wait for it to finish then serve from cache rather than making a second AI call.
+    let resolveInFlight = null;
+    if (!traktData && !isHomepageQuery && enableAiCache) {
+      if (aiInFlightRequests.has(cacheKey)) {
+        logger.info("Coalescing with in-flight AI request", { cacheKey });
+        await aiInFlightRequests.get(cacheKey).catch(() => {});
+        const coalesced = aiRecommendationsCache.get(cacheKey);
+        if (coalesced?.data) {
+          const recs =
+            type === "movie"
+              ? coalesced.data.recommendations?.movies || []
+              : coalesced.data.recommendations?.series || [];
+          if (recs.length > 0) {
+            const metas = (
+              await Promise.all(
+                recs.map((item) =>
+                  toStremioMeta(item, platform, tmdbKey, rpdbKey, rpdbPosterType, language, configData, includeAdult)
+                )
+              )
+            ).filter(Boolean);
+            logger.debug("Catalog handler response (coalesced in-flight)", { metasCount: metas.length });
+            return { metas };
+          }
+        }
+        // In-flight failed or returned empty — fall through to make our own call
+      } else {
+        const inFlightPromise = new Promise((resolve) => {
+          resolveInFlight = resolve;
+        });
+        aiInFlightRequests.set(cacheKey, inFlightPromise);
+      }
+    }
+
     try {
       const genAI = new GoogleGenerativeAI(geminiKey);
       const model = genAI.getGenerativeModel({ model: geminiModel });
@@ -4307,6 +4350,13 @@ const catalogHandler = async function (args, req) {
           configNumResults: numResults,
         });
 
+        // Unblock any requests that were waiting for this result
+        if (resolveInFlight) {
+          resolveInFlight();
+          aiInFlightRequests.delete(cacheKey);
+          resolveInFlight = null;
+        }
+
         logger.debug("AI recommendations result cached", {
           cacheKey,
           duration: Date.now() - startTime,
@@ -4436,6 +4486,11 @@ const catalogHandler = async function (args, req) {
 
       return { metas: finalMetas };
     } catch (error) {
+      // Release any waiting in-flight requests on failure
+      if (resolveInFlight) {
+        resolveInFlight();
+        aiInFlightRequests.delete(cacheKey);
+      }
       logger.error("Gemini API Error:", { error: error.message, stack: error.stack, query: searchQuery });
       let errorMessage = 'The AI model failed to respond. This may be a temporary issue.';
       if (error.message.includes('400') || error.message.includes('API key not valid')) {
