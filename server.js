@@ -295,6 +295,10 @@ async function refreshTraktToken(username, refreshToken) {
 
 const ENABLE_LOGGING = process.env.ENABLE_LOGGING === "true" || false;
 
+// Cache validated tokens for 5 minutes to avoid a /users/me preflight on every request
+const traktTokenValidatedAt = new Map(); // username -> timestamp
+const TRAKT_TOKEN_VALIDATION_TTL = 5 * 60 * 1000;
+
 if (ENABLE_LOGGING) {
   logger.info("Logging enabled via ENABLE_LOGGING environment variable");
 }
@@ -667,6 +671,46 @@ async function startServer() {
                     }
                   } else {
                     decryptedConfig.TraktAccessToken = tokenData.access_token;
+                    // Validate the token is still accepted by Trakt (catches revoked tokens or
+                    // client_id mismatches that expiry-based checks can't detect).
+                    // Skip validation if we already confirmed this token within the last 5 minutes.
+                    const lastValidated = traktTokenValidatedAt.get(decryptedConfig.traktUsername);
+                    const needsValidation = !lastValidated || Date.now() - lastValidated > TRAKT_TOKEN_VALIDATION_TTL;
+                    if (needsValidation) {
+                      try {
+                        const validateRes = await fetch(`${TRAKT_API_BASE}/users/me`, {
+                          headers: {
+                            "Content-Type": "application/json",
+                            "trakt-api-version": "2",
+                            "trakt-api-key": TRAKT_CLIENT_ID,
+                            Authorization: `Bearer ${decryptedConfig.TraktAccessToken}`,
+                          },
+                        });
+                        if (validateRes.status === 401 || validateRes.status === 403) {
+                          traktTokenValidatedAt.delete(decryptedConfig.traktUsername);
+                          logger.warn(`Trakt token rejected (${validateRes.status}) for ${decryptedConfig.traktUsername}, attempting refresh.`);
+                          const refreshToken = tokenData.refresh_token || encryptedTokenData?.refresh_token;
+                          const newTokens = refreshToken
+                            ? await refreshTraktToken(decryptedConfig.traktUsername, refreshToken)
+                            : null;
+                          if (newTokens) {
+                            decryptedConfig.TraktAccessToken = newTokens.access_token;
+                            decryptedConfig.TraktRefreshToken = newTokens.refresh_token;
+                            decryptedConfig.TraktTokenExpiresAt = Date.now() + newTokens.expires_in * 1000;
+                            traktTokenValidatedAt.set(decryptedConfig.traktUsername, Date.now());
+                            logger.info(`Trakt token refreshed successfully for ${decryptedConfig.traktUsername}.`);
+                          } else {
+                            delete decryptedConfig.TraktAccessToken;
+                            decryptedConfig.traktConnectionError = true;
+                            logger.warn(`Trakt token refresh failed for ${decryptedConfig.traktUsername}. User must re-authenticate.`);
+                          }
+                        } else {
+                          traktTokenValidatedAt.set(decryptedConfig.traktUsername, Date.now());
+                        }
+                      } catch (validateErr) {
+                        logger.warn(`Trakt token validation request failed for ${decryptedConfig.traktUsername}`, { error: validateErr.message });
+                      }
+                    }
                   }
                 } else {
                   delete decryptedConfig.TraktAccessToken;
