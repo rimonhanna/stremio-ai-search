@@ -653,6 +653,10 @@ async function startServer() {
                   } else {
                     decryptedConfig.TraktAccessToken = tokenData.access_token;
                   }
+                } else {
+                  delete decryptedConfig.TraktAccessToken;
+                  decryptedConfig.traktConnectionError = true;
+                  logger.warn(`Proceeding without Trakt data for ${decryptedConfig.traktUsername} because no stored tokens were found. The user needs to reconnect Trakt.`);
                 }
               }
             }
