@@ -10,7 +10,7 @@ An intelligent search addon for Stremio powered by Google's Gemini AI. Get perso
 
 ## Features
 
-- Trakt integration to help Gemini suggest personalized recommendations. Note: Only searches starting with "Recommend" will provide personalized recommendations using your watch history from Trakt.
+- Trakt integration to help Gemini suggest personalized recommendations and filter watched movies/shows. Note: Only searches starting with "Recommend" will provide personalized recommendations using your watch history from Trakt.
 - Select any of the Google AI models in the addon configuration
 - You can set the number of recommendations AI should return for a query (30 Max)
 - TMDB integration ensures you have a content rich catalog for movies and series
@@ -461,12 +461,12 @@ When self-hosting the addon, you can configure the following environment variabl
 - `HOST` - Your domain/hostname without protocol (e.g., `example.com` or `localhost:7000`)
 - `TRAKT_CLIENT_ID` - Your Trakt API client ID
 - `TRAKT_CLIENT_SECRET` - Your Trakt API client secret
-- `ENCRYPTION_KEY` - Key used for encrypting sensitive configuration data
+- `ENCRYPTION_KEY` - Key used for encrypting sensitive configuration data. Use a stable 32-byte random value, for example from `openssl rand -hex 32`. Do not rotate it unless you are okay invalidating existing encrypted addon config URLs.
 - `RPDB_API_KEY` - API key for RPDB integration
 - `ENABLE_LOGGING` - Set to "true" to enable logging
 - `GITHUB_TOKEN` - GitHub token for issue submission
 - `RECAPTCHA_SECRET_KEY` - Secret key for reCAPTCHA
-- `ADMIN_TOKEN` - Token required for accessing cache management endpoints (new)
+- `ADMIN_TOKEN` - Token required for accessing cache management endpoints. Use a long random value, for example from `openssl rand -hex 32`.
 
 ### Admin Endpoints
 

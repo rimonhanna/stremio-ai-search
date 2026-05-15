@@ -1388,8 +1388,8 @@ async function startServer() {
       });
     });
 
-    app.use("/", addonRouter);
     app.use(BASE_PATH, addonRouter);
+    app.use("/", addonRouter);
 
     app.post(["/encrypt", "/aisearch/encrypt"], express.json(), async (req, res) => {
       try {
