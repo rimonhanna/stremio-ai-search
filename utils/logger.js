@@ -33,6 +33,20 @@ function writeLog(level, message, data) {
     logMessage,
     () => {} // Silent error handling
   );
+
+  // Render and most hosted platforms collect stdout/stderr, not local log files.
+  if (ENABLE_LOGGING) {
+    const consoleMessage = data
+      ? `${level}: ${message} ${JSON.stringify(data)}`
+      : `${level}: ${message}`;
+    if (level === "ERROR") {
+      console.error(consoleMessage);
+    } else if (level === "WARN") {
+      console.warn(consoleMessage);
+    } else {
+      console.log(consoleMessage);
+    }
+  }
 }
 
 /**
