@@ -1050,6 +1050,7 @@
       const addonName = "AI Search";
       const TRAKT_CLIENT_ID = "YOUR_ADDON_CLIENT_ID"; // This will be replaced with the actual client ID from the server
       const HOST = "stremio.itcon.au"; // This will be replaced with the actual host from the server
+      let traktAuthJustUpdated = false;
 
       function setLoading(isLoading) {
         const configureBtn = document.getElementById("configureBtn");
@@ -1170,7 +1171,7 @@
           // 2. Prepare the Trakt authentication data object (only if a new login just occurred)
           let traktAuthData = null;
           const newAccessToken = document.getElementById("traktAccessToken").value.trim();
-          if (newAccessToken && configData.traktUsername) { // Check username to ensure a successful auth flow
+          if (traktAuthJustUpdated && newAccessToken && configData.traktUsername) { // Check username to ensure a successful auth flow
               traktAuthData = {
                   username: configData.traktUsername,
                   accessToken: newAccessToken,
@@ -1219,6 +1220,9 @@
         const traktRefreshToken = document
           .getElementById("traktRefreshToken")
           .value.trim();
+        const traktUsername = document
+          .getElementById("traktUsername")
+          .value.trim();
         const fanartKey = document.getElementById("fanartKey").value.trim();
 
         try {
@@ -1231,8 +1235,9 @@
               GeminiApiKey: geminiKey,
               TmdbApiKey: tmdbKey,
               FanartApiKey: fanartKey,
-              TraktAccessToken: traktAccessToken,
+              TraktAccessToken: traktAuthJustUpdated ? traktAccessToken : "",
               TraktRefreshToken: traktRefreshToken,
+              traktUsername: traktAuthJustUpdated ? "" : traktUsername,
             }),
           });
 
@@ -1252,7 +1257,7 @@
           }
 
           // Show Trakt validation errors if any, but don't block submission
-          if (traktAccessToken && !result.trakt) {
+          if ((traktAccessToken || traktUsername) && !result.trakt) {
             warnings.push("Trakt.tv: " + result.errors.trakt);
           }
 
@@ -1587,6 +1592,7 @@ window.addEventListener("message", async function (event) {
             document.getElementById("traktRefreshToken").value = refresh_token;
             document.getElementById("traktExpiresIn").value = expires_in;
             document.getElementById("traktUsername").value = username;
+            traktAuthJustUpdated = true;
 
             updateTraktStatus(
               `Connected as ${username}`,

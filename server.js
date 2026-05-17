@@ -1473,6 +1473,26 @@ async function startServer() {
           configData.TraktAccessToken = traktAuthData.accessToken;
           configData.TraktRefreshToken = traktAuthData.refreshToken;
           configData.TraktTokenExpiresAt = Date.now() + traktAuthData.expiresIn * 1000;
+        } else if (configData.traktUsername) {
+          let tokenData = await getTokens(configData.traktUsername);
+          if (tokenData && tokenData.expires_at < Date.now() + 5 * 60 * 1000) {
+            const refreshedTokens = await refreshTraktToken(
+              configData.traktUsername,
+              tokenData.refresh_token
+            );
+            if (refreshedTokens) {
+              tokenData = {
+                access_token: refreshedTokens.access_token,
+                refresh_token: refreshedTokens.refresh_token,
+                expires_at: Date.now() + refreshedTokens.expires_in * 1000,
+              };
+            }
+          }
+          if (tokenData) {
+            configData.TraktAccessToken = tokenData.access_token;
+            configData.TraktRefreshToken = tokenData.refresh_token;
+            configData.TraktTokenExpiresAt = tokenData.expires_at;
+          }
         }
 
         if (!configData.RpdbApiKey) {
